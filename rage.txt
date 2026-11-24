@@ -1,0 +1,1079 @@
+// =============================================================================
+// neverlose_rage.cpp
+//
+// Восстановленная логика рейджбота Neverlose (CS2) по сырому дампу модуля
+//   cs2_212C3300000.bin  —  base 0x212C3300000, image size 0x5001000
+// и по разбору neverlose.txt.
+//
+// Это ЧИТАЕМАЯ РЕКОНСТРУКЦИЯ алгоритма, а не дословный декомпиль:
+//   * имена структур и полей выведены из того, как код их использует;
+//   * смещения полей сверены с дизассемблером и указаны в комментариях;
+//   * AVX-развёртка на 8 направлений сведена к скалярным циклам —
+//     результат математически тот же, порядок операций упрощён;
+//   * места, где семантика поля не доказана, помечены "TODO";
+//   * функции трассировки мира (0x2F19C0 / 0x2F2110 / 0x2F0DD0) оставлены
+//     интерфейсами: их тела — обход геометрии движка, а не алгоритм выбора.
+//     Генерация точек (0x51E4F0) восстановлена: пороги урона, множители
+//     групп, отсев по углу и дальности, раскладка точек по хитбоксам.
+//
+// Все числовые константы сняты из дампа по RIP-relative адресам.
+// =============================================================================
+
+#include <cstdint>
+#include <cmath>
+#include <algorithm>
+
+namespace rage {
+
+// -----------------------------------------------------------------------------
+// Примитивы
+// -----------------------------------------------------------------------------
+
+struct Vec3 {
+    float x, y, z;
+
+    Vec3 operator-(const Vec3& o) const { return { x - o.x, y - o.y, z - o.z }; }
+    Vec3 operator+(const Vec3& o) const { return { x + o.x, y + o.y, z + o.z }; }
+    Vec3 operator*(float s)       const { return { x * s,   y * s,   z * s   }; }
+
+    float length_sqr() const { return x * x + y * y + z * z; }
+    float length()     const { return std::sqrt(length_sqr()); }
+
+    // Нормализация с тем же допуском, что в бинаре:
+    // длина вне (1e-6 .. 1e18) считается вырожденной -> нулевой вектор.
+    Vec3 normalized() const {
+        const float len = length();
+        if (len < 1e-6f || len > 1e18f)
+            return { 0.f, 0.f, 0.f };
+        return *this * (1.f / len);
+    }
+};
+
+inline float dot(const Vec3& a, const Vec3& b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+// -----------------------------------------------------------------------------
+// Структуры. Смещения — как в дампе (см. neverlose.txt).
+// -----------------------------------------------------------------------------
+
+// Точка прицеливания. Элемент вектора по ctx+0xD0, шаг 0x58.
+struct Point {
+    Vec3  pos;            // +0x00
+    float damage;         // +0x0C  итоговый урон по этой точке
+    void* target;         // +0x10  -> Target
+    void* anchor;         // +0x18  опорная точка (центр хитбокса), Vec3 по +0x00
+    void* hit_geom;       // +0x20  геометрия попадания: +0x38 группа, +0x39 подгруппа
+    void* record;         // +0x28  запись лага: +0x00 тик, +0x80 таблица разброса
+    float damage_ratio;   // +0x30  отношение итогового урона к предварительному
+    // +0x34 .. +0x43 : четыре показателя Hitchance (см. Hitchance)
+    float prob_min;       // +0x34  доля направлений с уроном >= порога  (1/64)
+    float prob_lethal;    // +0x38  доля направлений с уроном >  летальн. (1/64)
+    float prob_body;      // +0x3C  доля попаданий в туловище             (1/64)
+    float avg_damage;     // +0x40  средний оценочный урон                (1/64)
+    // +0x44 .. +0x53 : те же четыре числа после повторной оценки (second_eval)
+    float re_prob_min;    // +0x44
+    float re_prob_lethal; // +0x48
+    float re_prob_body;   // +0x4C
+    float re_avg_damage;  // +0x50
+};
+
+static_assert(sizeof(Point) == 0x58, "шаг элемента вектора кандидатов = 0x58");
+
+// Четыре выходных числа 0x526290.
+struct Hitchance {
+    float prob_min;     // +0x00
+    float prob_lethal;  // +0x04
+    float prob_body;    // +0x08
+    float avg_damage;   // +0x0C
+};
+
+// Цель. Указатель хранится в Point::target. Элемент вектора целей по
+// ctx+0x20, шаг 0xD0 — больше, чем разобранные поля; хвост не используется
+// логикой выбора.
+struct Target {
+    void*  ent;               // +0x08  сущность: +0x28 флаг, +0x48 множитель, +0x50 флаг
+    int    owner;             // +0x18  владелец, для сопоставления с бронёй
+    float  lethal_damage;     // +0x14  порог "летального" урона (пишет 0x51E4F0)
+    float  min_damage;        // +0x18  минимально допустимый урон
+    float  hitgroup_scale[12]; // +0x20  множитель урона по группе попадания
+    float  group_range_sqr[12]; // +0x50  предельная дальность группы, в квадрате
+    void*  hitboxes_begin;    // +0xD8  геометрия хитбоксов, шаг элемента 0x48
+    void*  hitboxes_end;      // +0xE0
+};
+
+// Контекст сканирования. this всех функций.
+struct ScanContext {
+    Vec3   eye;             // +0x54  позиция глаз (используется компаратором)
+    Vec3   view_forward;    // +0x60  направление взгляда (единичный вектор)
+    float  hitchance_req;   // +0x8C  требуемая вероятность попадания
+    float  min_damage_setting; // +0x88  настройка минимального урона
+    float  fov_cos;         // +0xA4  косинус порога угла обзора (0 = без ограничения)
+    int    tick;            // +0x18  текущий тик (для кэша по хитбоксам)
+    uint8_t mode;           // +0x50  режим подготовки урона
+    uint8_t prefer_body;    // +0x51  предпочитать туловище
+    uint8_t flag_a8;        // +0xA8  доп. условие ветки туловища
+    int    damage_flags;    // +0xAC  флаги, передаются в трассировку
+    float  bc;              // +0xBC  порог ветки туловища (сравнивается с 1.0)
+    uint8_t hitgroup_mask[32]; // +0xCC  битовые маски допустимых групп
+    Target* targets_begin;  // +0x20  вектор целей, шаг 0xD0
+    Target* targets_end;    // +0x28
+    Point* points_begin;    // +0xD0  вектор кандидатов, шаг 0x58
+    Point* points_end;      // +0xD8
+    Point* best;            // +0xE8  выбранная точка
+    void*  record;          // +0xF0  запись лага локального игрока (+0x58 тик)
+    int    weapon_damage;   // +0xF8  базовый урон оружия
+    float  weapon_range;    // +0x100 дальность: направление масштабируется на неё
+    float  range_modifier;  // +0x10C модификатор падения урона с расстоянием
+    void*  local;           // +0x110 локальный игрок / оружие
+    uint16_t trace_mode;    // +0x118 режим трассировки (0x1F = особый)
+    Vec3   spread_basis[64]; // +0x140 64 пары (yaw, pitch) разброса, по 8 байт
+    float  cached_spread;   // +0x340 кэш масштаба разброса
+    float  cached_rcp;      // +0x344 1/sqrt(spread), пересчитывается при смене
+    uint8_t body_only;      // +0xC8  сравнивать только по показателю туловища
+};
+
+// -----------------------------------------------------------------------------
+// Внешние зависимости движка. Тела здесь не восстанавливаются —
+// это обход геометрии карты и таблиц разброса, а не логика выбора.
+// -----------------------------------------------------------------------------
+
+// Результат пересечения луча с хитбоксом цели (0x2F19C0).
+struct IntersectResult {
+    Vec3   hit_pos;     // +0x00
+    float  fraction;    // +0x0C  (1.0f, если луч не встретил геометрию)
+    void*  geom;        // +0x10  геометрия попадания, nullptr = промах
+    int    hitgroup;    // +0x38
+};
+
+// Пересечение луча с одним хитбоксом-капсулой (0x35F19C0, тело цикла).
+// Капсула задаётся двумя концами (box+0x0C и box+0x18) и радиусом (box+0x34).
+// Возвращает расстояние вдоль луча до ближайшей точки входа, либо -1.
+static float ray_capsule(const Vec3& origin, const Vec3& dir, const Hitbox& box) {
+    const Vec3 a = box.capsule;                         // +0x0C
+    const Vec3 axis = box.axis_x;                       // +0x18, направление оси
+    const float radius = box.radius;                    // +0x34
+
+    // Проекция луча на плоскость, перпендикулярную оси капсулы.
+    const Vec3 rel = origin - a;
+    const Vec3 perp = dir - axis * dot(dir, axis);
+    const float perp_len = perp.length();
+    if (perp_len < 1e-5f)
+        return -1.f;
+
+    // Квадрат расстояния от луча до оси капсулы.
+    const Vec3 n = perp * (1.f / perp_len);
+    const float dist_sqr = dot(rel, n);
+    const float gap = radius * radius - dist_sqr * dist_sqr;
+    if (gap <= 0.f)
+        return -1.f;
+
+    // Ближайшая точка входа в капсулу вдоль луча.
+    const float along = dot(rel, axis);
+    const float enter = along - std::sqrt(gap);
+    if (enter < 0.f)
+        return -1.f;
+    return enter;
+}
+
+// 0x35F19C0 — пересечение луча с хитбоксами цели.
+//
+// Обходит массив хитбоксов (шаг 0x48) и для каждого считает пересечение
+// луча с капсулой. Хитбоксы делятся на три класса по полю +0x3A:
+//   0..2 — конечности, 3..6 — туловище, 7 — голова.
+// В каждом классе запоминается ближайшее попадание, и в конце выбирается
+// одно: голова бьёт туловище, туловище бьёт конечности, при равенстве
+// класса побеждает меньшее расстояние вдоль луча.
+//
+// Возвращает false, если пересечения нет. Иначе пишет точку попадания,
+// расстояние вдоль луча и указатель на хитбокс.
+bool intersect_target(IntersectResult& out, const Vec3& origin,
+                      const Vec3& dir, void* target_geom) {
+    auto* geom = static_cast<uint8_t*>(target_geom);
+    auto* begin = reinterpret_cast<Hitbox*>(*reinterpret_cast<void**>(geom));
+    auto* end   = reinterpret_cast<Hitbox*>(*reinterpret_cast<void**>(geom + 8));
+
+    struct Best { float dist; const Hitbox* box; };
+    Best best[3] = { { 1e30f, nullptr }, { 1e30f, nullptr }, { 1e30f, nullptr } };
+
+    for (const Hitbox* box = begin; box != end; ++box) {
+        const int cls = box->cls;                       // +0x3A, класс 0..7
+        if (cls > 7)
+            break;
+
+        const float enter = ray_capsule(origin, dir, *box);
+        if (enter < 0.f)
+            continue;
+
+        const int slot = cls >= 7 ? 2 : cls >= 3 ? 1 : 0;
+        if (enter < best[slot].dist)
+            best[slot] = { enter, box };
+    }
+
+    // Выбор класса: голова (2), затем туловище (1), затем конечности (0).
+    const Best* chosen = nullptr;
+    for (int slot = 2; slot >= 0; --slot)
+        if (best[slot].box && (!chosen || best[slot].dist < chosen->dist))
+            chosen = &best[slot];
+    if (!chosen)
+        return false;
+
+    out.hit_pos  = origin + dir * chosen->dist;
+    out.fraction = chosen->dist;
+    out.geom     = const_cast<Hitbox*>(chosen->box);
+    out.hitgroup = chosen->box->group;
+    return true;
+}
+
+// Трассировка луча по миру с учётом пробития (0x2F2110 + 0x2F0DD0).
+struct TraceResult {
+    void* surface;      // +0x00  поверхность; +0x33 = признак допустимого контакта
+    void* hit;          // +0x08  данные попадания; +0x08 = нанесённый урон
+};
+
+bool trace_and_resolve(TraceResult& out, const Vec3& origin, const Vec3& dir,
+                       int damage_flags, float max_range);
+
+// exp() падения урона. В бинаре это вызов 0x4093590: e^( -dist * range_modifier ).
+inline float damage_falloff(float exponent) { return std::exp(exponent); }
+
+// Хитбокс. Элемент массива геометрии цели, шаг 0x48 (см. 0x35F19C0 и 0x51E4F0).
+struct Hitbox {
+    Vec3  center;     // +0x00
+    Vec3  capsule;    // +0x0C  вторая точка капсулы
+    Vec3  axis_x;     // +0x18  ориентация, по столбцам
+    Vec3  axis_y;     // +0x24
+    Vec3  axis_z;     // +0x30  .x = полуось
+    float radius;     // +0x34
+    uint8_t group;    // +0x38
+    uint8_t subgroup; // +0x39
+    uint8_t cls;      // +0x3A  класс: 0..2 конечности, 3..6 туловище, 7 голова
+};
+
+// Зависимости движка, которые логика выбора только вызывает.
+// Множитель урона группы попадания (0x3ABDB90).
+float hitgroup_scale(void* entity, int group, void* local);
+// Чтение целого поля сущности по схеме (здоровье и т.п.).
+int schema_int(void* entity, int field);
+// Записи брони. Связный список с шагом 0x1A0 (0x51E5AC..0x51E605):
+//   +0x08 владелец, +0x4C коэффициент, +0x50 величина.
+struct ArmorRecord { int owner; float ratio; float amount; };
+ArmorRecord* armor_list_begin();
+ArmorRecord* armor_list_end();
+
+// -----------------------------------------------------------------------------
+// 0x51DAC0 — урон по направлению к точке.
+//
+// Направление нормализуется и умножается на дальность оружия (ctx+0x100).
+// Нет пересечения с целью -> -1, ещё до трассировки мира.
+// Предварительный урон считается с поправкой на расстояние и множителем
+// группы попадания; если он ниже порога target+0x18 — ранний выход.
+// На успехе возвращает итоговый урон и (опционально) пишет отношение
+// итогового урона к предварительному и указатель геометрии попадания.
+// -----------------------------------------------------------------------------
+
+float point_damage(ScanContext* ctx, Target* target, void* target_geom,
+                   const Vec3& point_pos, float* out_ratio, void** out_geom) {
+    const Vec3 delta = ctx->eye - point_pos;
+    const Vec3 dir   = delta.normalized();
+
+    // Масштаб направления дальностью оружия: луч обязан долететь.
+    const Vec3 ray = dir * ctx->weapon_range;
+
+    IntersectResult hit{};
+    if (!intersect_target(hit, point_pos, ray, target_geom) || !hit.geom)
+        return -1.f;
+
+    // Маска допустимой группы попадания: бит группы в ctx+0xCC.
+    const int group = hit.hitgroup;
+    if ((ctx->hitgroup_mask[group >> 5] & (1u << (group & 31))) == 0)
+        return -1.f;
+
+    // Предварительный урон: базовый * e^( -dist * range_modifier ) * множитель группы.
+    const float dist = (point_pos - hit.hit_pos).length();
+    const float base = static_cast<float>(ctx->weapon_damage);
+    float prelim = damage_falloff(-dist * ctx->range_modifier) * base;
+    prelim *= target->hitgroup_scale[group];
+
+    // Ниже минимального порога — стрелять смысла нет.
+    if (prelim < target->min_damage)
+        return -1.f;
+
+    // Дальше — полная трассировка мира с пробитием.
+    TraceResult tr{};
+    if (!trace_and_resolve(tr, point_pos, ray, ctx->damage_flags, ctx->weapon_range))
+        return -1.f;
+    if (!tr.surface || !tr.hit)
+        return -1.f;
+
+    // Итоговый урон. В особом режиме трассировки (0x1F) берётся как есть,
+    // иначе домножается на множитель фактически поражённой группы.
+    float final_damage = tr.hit ? *reinterpret_cast<float*>(
+                              static_cast<uint8_t*>(tr.hit) + 0x08) : 0.f;
+    if (ctx->trace_mode != 0x1F) {
+        const int landed = *reinterpret_cast<int*>(
+                              static_cast<uint8_t*>(tr.surface) + 0x38);
+        final_damage *= target->hitgroup_scale[landed];
+    }
+    if (final_damage <= 0.f)
+        return -1.f;
+
+    if (out_ratio) *out_ratio = final_damage / prelim;   // 0x51DED7
+    if (out_geom)  *out_geom  = hit.geom;                // 0x51DEE4
+    return final_damage;
+}
+
+// -----------------------------------------------------------------------------
+// 0x526290 — пакетная оценка 64 направлений.
+//
+// Это НЕ доля попаданий в один хитбокс. Функция пишет четыре float:
+//   +0x00  доля направлений с уроном >= target.min_damage        * 1/64
+//   +0x04  доля направлений с уроном >  target.lethal_damage     * 1/64
+//   +0x08  доля попаданий в туловище (группы 2 и 3), либо 0      * 1/64
+//   +0x0C  средний оценочный урон (промахи дают 0)               * 1/64
+//
+// Направления строятся по таблице разброса из записи лага (record+0x80):
+// 8 пакетов по 64 байта, в каждом 8 пар (yaw, pitch). Каждое направление —
+// это поворот луча "глаз -> точка" на соответствующую пару.
+//
+// ВАЖНО: урон направления считается БЕЗ отдельной трассировки мира.
+// Берётся коэффициент потери урона самой точки (point+0x30), затухание
+// и множитель фактически поражённой группы. Формула hits/64 этого
+// не воспроизводит.
+//
+// При нулевом разбросе (record+0x1C == 0) результат упрощается и для
+// второго показателя используется >=, а не >. Это отличие нельзя терять.
+// -----------------------------------------------------------------------------
+
+static constexpr int   kSpreadSamples = 64;
+static constexpr float kInvSamples    = 1.f / 64.f;   // 0x3C800000
+
+void evaluate_spread(ScanContext* ctx, Point* point, Hitchance* out) {
+    auto* record = static_cast<uint8_t*>(point->record);
+    auto* target = static_cast<Target*>(point->target);
+
+    // --- Ветка нулевого разброса -------------------------------------------------
+    if (*reinterpret_cast<float*>(record + 0x1C) == 0.f) {
+        out->prob_min = 1.f;
+        // второй показатель: >= (в основном пути строго >)
+        out->prob_lethal = (target->lethal_damage <= point->damage) ? 1.f : 0.f;
+
+        const int group = *reinterpret_cast<uint8_t*>(
+                              static_cast<uint8_t*>(point->hit_geom) + 0x39);
+        const bool body = (group & ~1) == 2;                 // группы 2 или 3
+        const bool suppressed = *reinterpret_cast<int*>(
+                              static_cast<uint8_t*>(target->ent) + 0x50) != 0;
+        out->prob_body  = (!suppressed && body) ? 1.f : 0.f;
+        out->avg_damage = point->damage;
+        return;
+    }
+
+    // --- Основной путь: 64 направления, пакетами по 8 ---------------------------
+    const Vec3 to_point = (point->pos - ctx->eye).normalized();
+
+    // Ортонормированный базис вокруг луча: по нему раскладываются пары
+    // (yaw, pitch) из таблицы разброса.
+    Vec3 basis_u, basis_v;
+    build_orthonormal_basis(to_point, basis_u, basis_v);   // см. ниже
+
+    const auto* table = reinterpret_cast<const Vec3*>(record + 0x80);
+
+    int   hits_min = 0, hits_lethal = 0, hits_body = 0;
+    float damage_sum = 0.f;
+
+    for (int batch = 7; batch >= 0; --batch) {          // счётчик с 7, 0x526720
+        const Vec3* pairs = table + batch * 8;          // пакет = 64 байта, 0x526783
+
+        bool all_lethal = true;
+        for (int lane = 0; lane < 8; ++lane) {
+            // Направление = луч + yaw * basis_u + pitch * basis_v, нормированное.
+            const Vec3 dir = (to_point
+                              + basis_u * pairs[lane].x
+                              + basis_v * pairs[lane].y).normalized();
+
+            IntersectResult hit{};
+            if (!intersect_target(hit, ctx->eye, dir * ctx->weapon_range, point->hit_geom)
+                || !hit.geom)
+                continue;
+
+            // Урон БЕЗ трассировки мира: затухание * база * коэф. точки * группа.
+            const float dist = (ctx->eye - hit.hit_pos).length();
+            const float base = static_cast<float>(ctx->weapon_damage);
+            const int   group = *reinterpret_cast<uint8_t*>(
+                                    static_cast<uint8_t*>(hit.geom) + 0x39);
+            float dmg = damage_falloff(-dist * ctx->range_modifier) * base;
+            dmg *= point->damage_ratio;
+            dmg *= target->hitgroup_scale[group];
+
+            damage_sum += dmg;
+            if (dmg >= target->min_damage)    ++hits_min;
+            if (dmg >  target->lethal_damage) ++hits_lethal;   // строго '>'
+            if ((group & ~1) == 2)            ++hits_body;
+        }
+
+        // Раннее завершение (0x5286EF): если все 8 направлений пакета летальны,
+        // оставшиеся пакеты не проверяются, а их вклад оценивается —
+        // поэтому нельзя утверждать, что всегда исполняются все 64 проверки.
+        if (all_lethal && batch > 0) {
+            const float remaining = static_cast<float>(batch);
+            hits_min    += 8 * batch;
+            hits_lethal += 8 * batch;
+            hits_body   += 8 * batch;
+            damage_sum  += damage_sum / (7 - batch + 1) * remaining;  // оценка
+            break;
+        }
+    }
+
+    const bool body_suppressed = *reinterpret_cast<int*>(
+                                    static_cast<uint8_t*>(target->ent) + 0x50) != 0;
+
+    out->prob_min    = hits_min * kInvSamples;
+    out->prob_lethal = (body_suppressed ? 0 : hits_lethal) * kInvSamples;
+    out->prob_body   = hits_body * kInvSamples;
+    out->avg_damage  = damage_sum * kInvSamples;
+}
+
+// Базис вокруг луча. В бинаре это векторное произведение с (0,0,1)
+// и повторная нормировка через vrsqrtps (0x5264A6..0x526511).
+void build_orthonormal_basis(const Vec3& forward, Vec3& u, Vec3& v) {
+    const Vec3 up = { 0.f, 0.f, 1.f };
+    u = Vec3{ forward.y * up.z - forward.z * up.y,
+              forward.z * up.x - forward.x * up.z,
+              forward.x * up.y - forward.y * up.x }.normalized();
+    v = Vec3{ u.y * forward.z - u.z * forward.y,
+              u.z * forward.x - u.x * forward.z,
+              u.x * forward.y - u.y * forward.x }.normalized();
+    u = u * -1.f;
+}
+
+// -----------------------------------------------------------------------------
+// 0x5248E0 — обработка одной точки.
+//
+// урон -> порог урона -> оценка вероятностей -> порог вероятности.
+// Точка отбрасывается (урон остаётся < 0), если не проходит любой порог
+// либо попадает в уже обработанный в этом тике хитбокс.
+// -----------------------------------------------------------------------------
+
+void process_point(ScanContext* ctx, Point* point) {
+    float ratio = 0.f;
+    void* geom  = nullptr;
+
+    const float dmg = point_damage(ctx,
+                                   static_cast<Target*>(point->target),
+                                   point->hit_geom, point->pos, &ratio, &geom);
+    if (dmg <= 0.f)
+        return;
+
+    point->damage       = dmg;
+    point->damage_ratio = ratio;
+    if (geom) point->hit_geom = geom;
+
+    auto* target = static_cast<Target*>(point->target);
+    if (dmg < target->min_damage)
+        return;
+
+    Hitchance hc{};
+    evaluate_spread(ctx, point, &hc);
+    point->prob_min    = hc.prob_min;
+    point->prob_lethal = hc.prob_lethal;
+    point->prob_body   = hc.prob_body;
+    point->avg_damage  = hc.avg_damage;
+
+    // Вероятность ниже требуемой — точка не годится.
+    if (point->prob_min < ctx->hitchance_req)
+        return;
+
+    // Кэш "хитбокс уже оценен в этом тике": группа 0xD -> слот 0x10,
+    // группа 0xE -> слот 0x12, остальные группы — как есть.
+    const int group = *reinterpret_cast<uint8_t*>(
+                          static_cast<uint8_t*>(point->hit_geom) + 0x38);
+    if (group == 1)
+        return;
+
+    int slot = group;
+    if (group == 0x0D)      slot = 0x10;
+    else if (group == 0x0E) slot = 0x12;
+
+    auto* cache = static_cast<uint8_t*>(target->ent);
+    const int seen_tick = *reinterpret_cast<int*>(cache + slot * 8 + 0x5318);
+    if (seen_tick == ctx->tick && cache[slot * 8 + 0x531C] != 0)
+        return;
+
+    *reinterpret_cast<int*>(cache + slot * 8 + 0x5318) = ctx->tick;
+    cache[slot * 8 + 0x531C] = 0;
+}
+
+// -----------------------------------------------------------------------------
+// 0x51BEA0 — попарный компаратор точек.
+//
+// Возвращает true, если `a` лучше `b`. Это НЕ взвешенная сумма:
+// сравнения идут по приоритетам с ранним выходом.
+//
+//   1. Точка, прошедшая одновременно порог урона и порог вероятности,
+//      всегда бьёт точку, не прошедшую оба (0x51BF1E..0x51BF6F).
+//   2. Если обе прошли и включён режим предпочтения туловища
+//      (ctx+0x51, ctx+0xA8, ctx+0xBC == 1), сравнивается признак
+//      "точка на туловище" (0x51C5F0).
+//   3. При равенстве — больший средний урон (допуск 0.05).
+//   4. При равенстве — большая вероятность попадания (допуск 0.15).
+//   5. При равенстве и mode == 2 — точка ближе к направлению взгляда
+//      (скалярное произведение с ctx+0x60).
+//   6. При равенстве порогов — меньше выстрелов до убийства, но только
+//      когда обе вероятности выше 0.6.
+//   7. При равенстве — большая вероятность летального урона (допуск 0.10),
+//      если хотя бы одна выше 0.4.
+//   8. При равенстве — больший средний урон повторной оценки (допуск 2.0).
+//   9. Последний рубеж — более свежая запись лага.
+//
+// `metric` (аргумент, байт со стека) выбирает, какой набор из четырёх
+// показателей сравнивается: 0 = первая четвёрка (+0x34), иначе вторая
+// (+0x44), которую пишет second_eval.
+// -----------------------------------------------------------------------------
+
+static bool approx_equal(float a, float b, float eps) {
+    return std::fabs(a - b) <= eps;
+}
+
+// 0x51C5F0: точка считается "туловищной", когда запись лага не помечена
+// как промах по конечностям (record+0x0C == 0).
+static bool is_body_point(const Point* p) {
+    return *reinterpret_cast<uint8_t*>(
+               static_cast<uint8_t*>(p->record) + 0x0C) == 0;
+}
+
+bool point_is_better(ScanContext* ctx, const Point* a, const Point* b,
+                     uint8_t metric, bool strict) {
+    if (!b) return true;
+    if (!a) return false;
+
+    auto* ta = static_cast<Target*>(a->target);
+    auto* tb = static_cast<Target*>(b->target);
+
+    // Какая четвёрка сравнивается: +0x34 или +0x44 (second_eval).
+    const float prob_a = metric ? a->re_prob_min  : a->prob_min;
+    const float prob_b = metric ? b->re_prob_min  : b->prob_min;
+    const float avg_a  = metric ? a->re_avg_damage : a->avg_damage;
+    const float avg_b  = metric ? b->re_avg_damage : b->avg_damage;
+    const float leth_a = metric ? a->re_prob_lethal : a->prob_lethal;
+    const float leth_b = metric ? b->re_prob_lethal : b->prob_lethal;
+
+    // Приоритет 1: пройти оба порога сразу.
+    const bool ready_a = a->damage >= ta->min_damage && prob_a >= ctx->hitchance_req;
+    const bool ready_b = b->damage >= tb->min_damage && prob_b >= ctx->hitchance_req;
+    if (ready_a != ready_b)
+        return ready_a;
+
+    // Приоритет 2: предпочтение туловища. Включается только когда оба
+    // порога пройдены и выставлены все три флага режима.
+    if (ready_a && ctx->prefer_body && ctx->flag_a8 && ctx->bc == 1.f)
+        if (is_body_point(a) != is_body_point(b))
+            return is_body_point(a);
+
+    // Приоритет 3: средний урон. Допуск 0.05.
+    if (!approx_equal(avg_a, avg_b, 0.05f))
+        return avg_a > avg_b;
+
+    // Приоритет 4: вероятность попадания. Допуск 0.15.
+    if (!approx_equal(prob_a, prob_b, 0.15f))
+        return prob_a > prob_b;
+
+    // Приоритет 5 (mode == 2): точка, чьё направление ближе к взгляду.
+    if (ctx->mode == 2) {
+        const float aim_a = dot((a->pos - ctx->eye).normalized(), ctx->view_forward);
+        const float aim_b = dot((b->pos - ctx->eye).normalized(), ctx->view_forward);
+        if (!approx_equal(aim_a, aim_b, 1e-3f))
+            return aim_a > aim_b;
+    }
+
+    // Приоритет 6: число выстрелов до убийства = round(lethal / damage),
+    // зажатое в [1..6]. Меньше — лучше. Считается, только когда обе
+    // вероятности выше 0.6 и пороги урона совпали.
+    if (prob_a > 0.6f && prob_b > 0.6f
+        && approx_equal(ta->min_damage, tb->min_damage, 0.f)) {
+        auto shots = [](float lethal, float dmg) {
+            int n = static_cast<int>(std::round(lethal / dmg));
+            return std::clamp(n, 1, 6);
+        };
+        const int sa = shots(ta->lethal_damage, a->damage);
+        const int sb = shots(tb->lethal_damage, b->damage);
+        if (sa != sb)
+            return sa < sb;
+    }
+
+    // Приоритет 7: вероятность летального урона. Допуск 0.10; если хотя бы
+    // одна выше 0.4, сравниваем, иначе считаем равными.
+    if (!approx_equal(leth_a, leth_b, 0.10f))
+        if (leth_a > 0.4f || leth_b > 0.4f)
+            return leth_a > leth_b;
+
+    // Приоритет 8: средний урон повторной оценки. Допуск 2.0.
+    if (!approx_equal(a->re_avg_damage, b->re_avg_damage, 2.f))
+        return a->re_avg_damage > b->re_avg_damage;
+
+    // Приоритет 9: свежесть записи лага. Больше тик — свежее.
+    const int tick_a = *reinterpret_cast<int*>(static_cast<uint8_t*>(a->record));
+    const int tick_b = *reinterpret_cast<int*>(static_cast<uint8_t*>(b->record));
+    return tick_a > tick_b;
+}
+
+// -----------------------------------------------------------------------------
+// 0x51C9C0 — уточнение точки.
+//
+// Точка сдвигается к центру масс тех направлений разброса, которые попали
+// по цели. Вес направления — его урон, зажатый сверху порогом
+//   lethal * (1 + 2.5 * max(lethal / min_damage - 1, 0))
+// то есть далёкие попадания не утягивают точку сильнее, чем ближние.
+//
+// Направление i строится как базис разброса (ctx+0x140, пары по 8 байт),
+// разложенный по ортонормированному базису луча "глаз -> точка". Попадание
+// определяется битовой маской, которую заполнила вторая оценка (0x51D320):
+// при body_only берётся маска туловища (record+0x38), иначе маска любого
+// попадания (record+0x30).
+//
+// Новая позиция = глаз + нормированная сумма (направление * вес).
+// Возвращает true, когда уточнение НЕ принято: нет попаданий, суммарный
+// вес нулевой, либо доля попаданий достигла 1 (сдвигать уже некуда).
+// -----------------------------------------------------------------------------
+
+bool refine_point(ScanContext* ctx, Point* point) {
+    auto* target = static_cast<Target*>(point->target);
+    auto* record = static_cast<uint8_t*>(point->record);
+
+    // Битовая маска попаданий: 64 бита в двух dword.
+    const uint32_t* mask = reinterpret_cast<uint32_t*>(
+        record + (ctx->body_only ? 0x38 : 0x30));
+    int hits = 0;
+    for (int i = 0; i < kSpreadSamples; ++i)
+        if (mask[i >> 5] & (1u << (i & 31)))
+            ++hits;
+    if (hits * kInvSamples >= 1.f)
+        return true;
+
+    // Порог веса: lethal * (1 + 2.5 * max(lethal / min_damage - 1, 0)).
+    const float ratio = target->lethal_damage / target->min_damage;
+    const float cap = target->lethal_damage
+                    * (1.f + 2.5f * std::max(ratio - 1.f, 0.f));
+
+    const Vec3 to_point = (point->pos - ctx->eye).normalized();
+    Vec3 basis_u, basis_v;
+    build_orthonormal_basis(to_point, basis_u, basis_v);
+    const auto* pairs = reinterpret_cast<const Vec3*>(ctx->spread_basis);
+
+    Vec3 accum = { 0.f, 0.f, 0.f };
+    float weight = 0.f;
+
+    for (int i = 0; i < kSpreadSamples; ++i) {
+        if ((mask[i >> 5] & (1u << (i & 31))) == 0)
+            continue;
+
+        const Vec3 dir = (to_point
+                          + basis_u * pairs[i].x
+                          + basis_v * pairs[i].y).normalized();
+
+        // Урон направления ограничен сверху порогом.
+        const float dmg = reinterpret_cast<float*>(record + 0x40)[i];
+        const float w = std::min(dmg, cap);
+        accum  = accum + dir * w;
+        weight += w;
+    }
+
+    if (weight <= 0.f)
+        return true;
+
+    // Новая позиция = глаз + нормированная сумма вкладов * дальность.
+    point->pos = ctx->eye + accum * (1.f / weight) * ctx->weapon_range;
+    return false;
+}
+
+// -----------------------------------------------------------------------------
+// 0x524A30 — выбор лучшей точки.
+//
+// 1. Линейный проход по вектору кандидатов (ctx+0xD0, шаг 0x58) с
+//    попарным компаратором. Точки с уроном < 0 пропускаются.
+// 2. Если кандидатов больше 512 — тот же отбор, но параллельно,
+//    чанками по min(16, число ядер). Результат идентичен.
+// 3. Победитель проходит повторную оценку вероятности (0x525830) и
+//    уточнение позиции (0x51C9C0). Уточнение принимается, только если
+//    повторная оценка не стала хуже исходной.
+// 4. Итог пишется в ctx+0xE8 и возвращается.
+// -----------------------------------------------------------------------------
+
+Point* select_best(ScanContext* ctx) {
+    ctx->best = nullptr;
+
+    const auto count = static_cast<size_t>(ctx->points_end - ctx->points_begin);
+
+    Point* best = nullptr;
+    if (count <= 0x1FF) {
+        for (Point* p = ctx->points_begin; p != ctx->points_end; ++p) {
+            if (p->damage < 0.f)
+                continue;
+            if (point_is_better(ctx, p, best, ctx->body_only, true))
+                best = p;
+        }
+    } else {
+        // Параллельный путь: чанки по числу ядер (не больше 16),
+        // внутри чанка тот же компаратор, затем слияние победителей.
+        // Опущен — результат совпадает с линейным проходом выше.
+        best = select_best_parallel(ctx);
+    }
+    if (!best)
+        return nullptr;
+
+    ctx->best = best;
+
+    // Повторная оценка четырёх показателей уже по выбранной точке.
+    // Это НЕ повторный evaluate_spread: 0x525830 гоняет 64 направления через
+    // полный point_damage (0x51D320), а не через приближение по damage_ratio.
+    Hitchance hc{};
+    second_eval(ctx, best, &hc);
+    best->re_prob_min    = hc.prob_min;
+    best->re_prob_lethal = hc.prob_lethal;
+    best->re_prob_body   = hc.prob_body;
+    best->re_avg_damage  = hc.avg_damage;
+
+    // Уточнение позиции. Масштаб шага зависит от разброса оружия:
+    //   radius = min( spread * 1.5 + 0.5 , 32 )
+    // Число попыток — от 1 до 3, шаг уточнения убывает линейно.
+    const float radius = std::min(ctx->cached_spread * 1.5f + 0.5f, 32.f);
+    const int   passes = std::clamp(
+        static_cast<int>(std::lround(24.f / radius * 3.f)), 1, 3);
+
+    Point refined = *best;
+    for (int pass = 0; pass < passes; ++pass) {
+        if (!refine_point(ctx, &refined))
+            break;
+    }
+
+    // Принимаем уточнение только если точка реально сдвинулась и
+    // повторная оценка не хуже (допуск 0.15 по вероятности, 0.12 по урону).
+    const bool moved = refined.pos.x != best->pos.x
+                    || refined.pos.y != best->pos.y
+                    || refined.pos.z != best->pos.z;
+    if (moved) {
+        Hitchance hc2{};
+        second_eval(ctx, &refined, &hc2);
+        const bool better = hc2.prob_min > best->re_prob_min + 0.15f
+                         || (approx_equal(hc2.prob_min, best->re_prob_min, 0.15f)
+                             && hc2.avg_damage > best->re_avg_damage + 0.12f);
+        if (better) {
+            best->pos            = refined.pos;
+            best->re_prob_min    = hc2.prob_min;
+            best->re_prob_lethal = hc2.prob_lethal;
+            best->re_prob_body   = hc2.prob_body;
+            best->re_avg_damage  = hc2.avg_damage;
+        }
+    }
+
+    // Отметка "хитбокс использован в этом тике" — та же таблица, что в
+    // process_point, но со значением 1 вместо 0.
+    const int group = *reinterpret_cast<uint8_t*>(
+                          static_cast<uint8_t*>(best->hit_geom) + 0x38);
+    if (group != 1 && best->re_prob_min >= ctx->hitchance_req) {
+        int slot = group;
+        if (group == 0x0D)      slot = 0x10;
+        else if (group == 0x0E) slot = 0x12;
+
+        auto* cache = static_cast<uint8_t*>(
+                          static_cast<Target*>(best->target)->ent);
+        *reinterpret_cast<int*>(cache + slot * 8 + 0x5318) = ctx->tick;
+        cache[slot * 8 + 0x531C] = 1;
+    }
+
+    return best;
+}
+
+// Заглушка параллельного пути. Тот же отбор, разбитый на чанки по числу
+// ядер (не больше 16); вынесена, чтобы не тащить сюда пул потоков.
+Point* select_best_parallel(ScanContext* ctx);
+
+// -----------------------------------------------------------------------------
+// 0x525830 — вторая оценка четырёх показателей, после выбора точки.
+//
+// В отличие от evaluate_spread (0x526290) здесь каждое из 64 направлений
+// прогоняется через полный point_damage (0x51DAC0), а не через приближение
+// по damage_ratio. Рабочая функция 0x51D320:
+//   * направление = базис разброса (record+0x00, пары по 8 байт),
+//     умноженный на масштаб (record+0x1C) и прибавленный к лучу;
+//   * точка попадания = глаз + направление * дальность оружия;
+//   * урон пишется в record+0x40[i], бит попадания — в record+0x30,
+//     бит попадания в туловище — в record+0x38.
+//
+// Сводка (0x525A01..0x526221):
+//   +0x00  доля направлений с уроном >= min_damage          * 1/64
+//   +0x04  доля направлений с уроном >= lethal_damage       * 1/64
+//   +0x08  доля попаданий в туловище (группы 2/3)           * 1/64
+//   +0x0C  средний урон (промахи дают 0)                    * 1/64
+// При нулевом разбросе результат упрощается так же, как в evaluate_spread.
+// -----------------------------------------------------------------------------
+
+void second_eval(ScanContext* ctx, Point* point, Hitchance* out) {
+    auto* record = static_cast<uint8_t*>(point->record);
+    auto* target = static_cast<Target*>(point->target);
+
+    if (*reinterpret_cast<float*>(record + 0x1C) == 0.f) {
+        out->prob_min = 1.f;
+        out->prob_lethal = (target->lethal_damage <= point->damage) ? 1.f : 0.f;
+        const int group = *reinterpret_cast<uint8_t*>(
+                              static_cast<uint8_t*>(point->hit_geom) + 0x39);
+        const bool body = (group & ~1) == 2;
+        const bool suppressed = *reinterpret_cast<int*>(
+                              static_cast<uint8_t*>(target->ent) + 0x50) != 0;
+        out->prob_body  = (!suppressed && body) ? 1.f : 0.f;
+        out->avg_damage = point->damage;
+        return;
+    }
+
+    const Vec3 to_point = (point->pos - ctx->eye).normalized();
+    Vec3 basis_u, basis_v;
+    build_orthonormal_basis(to_point, basis_u, basis_v);
+
+    const auto* pairs = reinterpret_cast<const Vec3*>(record);
+    const float spread = *reinterpret_cast<float*>(record + 0x1C);
+
+    int hits_min = 0, hits_lethal = 0, hits_body = 0;
+    float damage_sum = 0.f;
+
+    for (int i = 0; i < kSpreadSamples; ++i) {
+        const Vec3 dir = (to_point
+                          + basis_u * (pairs[i].x * spread)
+                          + basis_v * (pairs[i].y * spread)).normalized();
+
+        float ratio = 0.f;
+        void* geom  = nullptr;
+        const Vec3 hit_pos = ctx->eye + dir * ctx->weapon_range;
+        const float dmg = point_damage(ctx, target, point->hit_geom,
+                                       hit_pos, &ratio, &geom);
+        if (dmg <= 0.f || !geom)
+            continue;
+
+        damage_sum += dmg;
+        if (dmg >= target->min_damage)    ++hits_min;
+        if (dmg >= target->lethal_damage) ++hits_lethal;   // здесь '>=', не '>'
+
+        const int group = *reinterpret_cast<uint8_t*>(
+                              static_cast<uint8_t*>(geom) + 0x39);
+        if ((group & ~1) == 2)            ++hits_body;
+    }
+
+    const bool body_suppressed = *reinterpret_cast<int*>(
+                                    static_cast<uint8_t*>(target->ent) + 0x50) != 0;
+
+    out->prob_min    = hits_min * kInvSamples;
+    out->prob_lethal = hits_lethal * kInvSamples;
+    out->prob_body   = (body_suppressed ? 0 : hits_body) * kInvSamples;
+    out->avg_damage  = damage_sum * kInvSamples;
+}
+
+// -----------------------------------------------------------------------------
+// 0x51E4F0 — генерация точек-кандидатов по одной цели.
+//
+// Вызывается из scan для каждой цели (элемент вектора по ctx+0x20, шаг 0xD0).
+// this = ScanContext, аргумент = Target. Точки дописываются в вектор
+// ctx+0xD0 с шагом 0x58; урон при создании всегда -1, его посчитает
+// process_point.
+//
+// Хитбокс — элемент массива геометрии цели, шаг 0x48:
+//   +0x00 центр, +0x0C..+0x14 вторая точка (капсула),
+//   +0x18..+0x2C ориентация (3x3, по столбцам),
+//   +0x30 полуось, +0x34 радиус, +0x38 группа, +0x39 подгруппа.
+// -----------------------------------------------------------------------------
+
+static constexpr int   kHitboxCount   = 12;     // цикл rbx = 0..0xC
+
+// log(). В бинаре это 0x4097150: вызывается как log(min_damage / (damage * scale)).
+inline float damage_log(float x) { return std::log(x); }
+
+// Добавить точку в вектор кандидатов. Запись одна и та же во всех ветках
+// (0x52175A, 0x521870, 0x521929, 0x521C72): позиция, урон -1, цель, якорь,
+// геометрия хитбокса, запись лага; остаток обнуляется.
+void emit_point(ScanContext* ctx, Target* target, const Vec3& pos,
+                void* anchor, void* hitbox, void* record) {
+    Point* p = ctx->points_end;
+    p->pos          = pos;
+    p->damage       = -1.f;                    // 0xBF800000
+    p->target       = target;
+    p->anchor       = anchor;
+    p->hit_geom     = hitbox;
+    p->record       = record;
+    p->damage_ratio = 0.f;
+    p->prob_min = p->prob_lethal = p->prob_body = p->avg_damage = 0.f;
+    p->re_prob_min = p->re_prob_lethal = p->re_prob_body = p->re_avg_damage = 0.f;
+    ++ctx->points_end;
+}
+
+void prepare_candidates(ScanContext* ctx, Target* target) {
+    // --- Пороги урона -------------------------------------------------------
+    // lethal = здоровье цели (целая схема-переменная), min = настройка ctx+0x88.
+    target->lethal_damage = static_cast<float>(schema_int(target->ent, /*health*/ 0));
+    target->min_damage    = ctx->min_damage_setting;
+
+    // Броня снижает порог летального урона: для каждой записи брони с тем же
+    // владельцем и коэффициентом > 0.75 вычитается armor * ratio.
+    for (ArmorRecord* armor = armor_list_begin(); armor != armor_list_end(); ++armor)
+        if (armor->owner == target->owner && armor->ratio > 0.75f)
+            target->lethal_damage -= armor->amount * armor->ratio;
+    if (target->lethal_damage <= 0.f)
+        return;
+
+    // min_damage не может превышать lethal. В режиме ctx+0x50 == 1 он
+    // округляется к целому (round-to-nearest, vroundss 0xA) после деления
+    // пополам. Сверху оба порога зажаты 130.
+    if (target->min_damage > 100.f)
+        target->min_damage = target->lethal_damage;
+    else if (target->min_damage > target->lethal_damage)
+        target->min_damage = target->lethal_damage;
+    if (ctx->mode == 1)
+        target->min_damage = std::round(target->min_damage * 0.5f) * 2.f;
+    if (target->min_damage > 130.f)
+        target->min_damage = 130.f;
+
+    // --- Множитель и предельная дальность по каждой группе попадания -------
+    const float weapon_damage = static_cast<float>(ctx->weapon_damage);
+    for (int group = 0; group < kHitboxCount; ++group) {
+        // Базовый множитель группы спрашивается у движка (0x3ABDB90).
+        float scale = hitgroup_scale(target->ent, group, ctx->local);
+
+        // Для групп 0..8 из битовой маски 0x13D множитель урезается, если
+        // у цели мало здоровья: scale -= scale * 0.5 * base, и если остаток
+        // меньше удвоенного здоровья — берётся health*2 от базового.
+        const int health = schema_int(target->ent, /*health*/ 0);
+        if (health > 0 && group <= 8 && (0x13D & (1 << group))) {
+            const float cut = scale * 0.5f * scale;
+            scale = (scale - cut) * 0.5f <= health ? scale - cut
+                                                   : scale - 2.f * health;
+        }
+        target->hitgroup_scale[group] = scale;
+
+        // Дальность, на которой урон ещё не падает ниже порога:
+        //   dist = log(min_damage / (weapon_damage * scale)) / range_modifier + 10
+        // хранится квадратом и зажимается в [0 .. weapon_range].
+        const float dealt = weapon_damage * scale;
+        if (dealt < target->min_damage) {
+            target->group_range_sqr[group] = 0.f;
+            continue;
+        }
+        float dist = damage_log(target->min_damage / dealt) / ctx->range_modifier + 10.f;
+        dist = std::clamp(dist, 0.f, ctx->weapon_range);
+        target->group_range_sqr[group] = dist * dist;
+    }
+
+    // --- Раскладка точек по хитбоксам --------------------------------------
+    // Геометрия цели — массив элементов по 0x48 (begin..end по target+0xD8).
+    for (auto* raw = static_cast<uint8_t*>(target->hitboxes_begin);
+         raw != target->hitboxes_end;
+         raw += 0x48) {
+        const auto* box = reinterpret_cast<const Hitbox*>(raw);
+        const int group = box->group;             // +0x38
+        if (group == 1)                           // группа 1 не сканируется
+            continue;
+        if ((ctx->hitgroup_mask[group >> 5] & (1u << (group & 31))) == 0)
+            continue;
+
+        // Отсев по углу обзора: косинус между направлением на хитбокс и
+        // взглядом сравнивается с порогом ctx+0xA4 (0x520CF1..0x520DFF).
+        if (ctx->fov_cos > 0.f) {
+            const Vec3 to_box = (box->center - ctx->eye).normalized();
+            if (dot(to_box, ctx->view_forward) < ctx->fov_cos)
+                continue;
+        }
+
+        // Отсев по дальности: дальше квадрата дальности группы точка
+        // заведомо не даст минимального урона (0x520E40).
+        const int subgroup = box->subgroup;       // +0x39
+        if ((box->center - ctx->eye).length_sqr() > target->group_range_sqr[subgroup])
+            continue;
+
+        // Масштаб смещения от центра (0x520F88..0x521048).
+        //   dist   = |eye - center|
+        //   ratio  = clamp(4 * radius / dist, 0..1) * 0.4
+        //   spread = (hitchance_req - ratio) / (1 - ratio), зажатый в [0..1]
+        //   offset = dist * spread
+        // Для групп 0xB..0xE смещение не может превышать радиус,
+        // для групп из маски 0x50654 — удвоенную сумму радиуса и полуоси.
+        const float dist = (box->center - ctx->eye).length();
+        const float ratio = std::clamp(4.f * box->radius / dist, 0.f, 1.f) * 0.4f;
+        const float spread = std::clamp(
+            (ctx->hitchance_req - ratio) / (1.f - ratio), 0.f, 1.f);
+        const float offset = dist * spread;
+
+        if (group >= 0x0B && group <= 0x0E && offset > box->radius)
+            continue;
+        if ((0x50654 & (1 << group)) && offset > 2.f * (box->axis_z.x + box->radius))
+            continue;
+
+        // Центр хитбокса — всегда кандидат (0x5210A2).
+        emit_point(ctx, target, box->center, box, box, ctx->record);
+
+        // Смещённые точки есть только у туловища (группы 2 и 3, 0x5216B2).
+        // Позиция = центр - ориентация * offset, то есть точка сдвигается
+        // от центра к стрелку на величину, вычисленную выше (0x5216FE).
+        if (group == 2 || group == 3) {
+            const Vec3 toward = (ctx->eye - box->center).normalized();
+            const Vec3 shifted = box->center - toward * offset;
+            emit_point(ctx, target, shifted, box, box, ctx->record);
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// 0x5239D0 — организация сканирования.
+//
+// Порядок восстановлен по вызовам внутри функции:
+//   0x5244E6  prepare_candidates по каждой цели (вектор ctx+0x20, шаг 0xD0);
+//   0x5245AE  process_point по каждой порождённой точке;
+//   0x5246DF  select_best.
+// При одной точке обработка идёт напрямую, при 0x21 и больше — параллельно,
+// чанками по числу ядер. Результат тот же, поэтому свёрнуто в один цикл.
+//
+// Таблица разброса (ctx+0x140, 16 пар) собирается в 0x524364..0x5244B5 как
+// произведение масштаба оружия на константную таблицу модуля. В дампе эта
+// таблица лежит в обнулённом при загрузке разделе, поэтому здесь она —
+// входной параметр, а не зашитые числа.
+// -----------------------------------------------------------------------------
+
+Point* scan(ScanContext* ctx) {
+    // Привязка записи лага по индексу из ctx+0x00. Индекс маскируется
+    // 0x7FFF и адресует таблицу записей с шагом 0x53C0 (0x523A1D..0x523A9A).
+    bind_lag_record(ctx);
+
+    // Генерация точек. Цели лежат отдельным вектором, не тем, что кандидаты.
+    for (Target* t = ctx->targets_begin; t != ctx->targets_end; ++t)
+        prepare_candidates(ctx, t);
+
+    for (Point* p = ctx->points_begin; p != ctx->points_end; ++p)
+        process_point(ctx, p);
+
+    return select_best(ctx);
+}
+
+void bind_lag_record(ScanContext* ctx);        // 0x523A1D..0x523A9A
+
+// -----------------------------------------------------------------------------
+// 0x380FE80 — перевод выбранной точки в угол выстрела.
+//
+// Вызывается уже после select_best, когда точка записана в слот команды.
+// Вектор от глаз до точки переводится в углы через atan2, затем из pitch
+// вычитается отдача оружия. Множитель градус->радиан снят из дампа:
+// 0x380FE84 грузит 0.01745329, это pi/180.
+//
+// Отдача — накопленная по выстрелам величина (0x380FEC8..0x380FFD0): для
+// каждого выстрела в очереди берётся его угол отдачи, переводится так же
+// и суммируется. Здесь свёрнуто в один аргумент recoil_pitch.
+// -----------------------------------------------------------------------------
+
+static constexpr float kDeg2Rad = 0.01745329f;   // 0x8F87CC
+
+struct AimAngles { float pitch, yaw; };
+
+AimAngles aim_angles(const Vec3& eye, const Vec3& point, float recoil_pitch) {
+    const Vec3 d = point - eye;
+    const float hyp = std::sqrt(d.x * d.x + d.y * d.y);
+
+    AimAngles a;
+    a.yaw   = std::atan2(d.y, d.x) / kDeg2Rad;
+    a.pitch = std::atan2(-d.z, hyp) / kDeg2Rad - recoil_pitch;
+    return a;
+}
+
+} // namespace rage

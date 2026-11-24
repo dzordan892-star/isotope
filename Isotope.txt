@@ -1,0 +1,1 @@
+& "$env:LOCALAPPDATA\Programs\ai.opencode.desktop\OpenCode.exe"
